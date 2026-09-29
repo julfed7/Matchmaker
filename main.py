@@ -1,7 +1,7 @@
 """
 Matchmaker для Cubism D.
+Авто-подбор: хост создаёт комнату, матчмейкер ищет игроков.
 Деплой на Render.com.
-Режимы: classic (2-4), battle_royale (4-20).
 """
 
 import asyncio
@@ -22,247 +22,207 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Конфигурация режимов
 MODES = {
-    "classic": {
-        "min_players": 2,
-        "max_players": 4,
-        "timeout_sec": 30,
-    },
-    "battle_royale": {
-        "min_players": 4,
-        "max_players": 20,
-        "timeout_sec": 60,
-    },
+    "classic":       {"min_players": 2, "max_players": 4, "timeout_sec": 30},
+    "battle_royale": {"min_players": 4, "max_players": 20, "timeout_sec": 60},
 }
 
 
 @dataclass
-class Player:
-    player_id: str
-    nickname: str
-    mode: str
-    ws: object
-    match_id: Optional[str] = None
-
-
-@dataclass
-class Match:
+class Room:
     match_id: str
     mode: str
-    host_id: str
-    players: list = field(default_factory=list)
-    host_oid: Optional[str] = None
+    map_name: str
+    host_nickname: str
+    host_ws: object
+    host_oid: str
+    max_players: int
+    players: list = field(default_factory=list)  # список (ws, nickname)
+    match_started: bool = False
 
 
 class Matchmaker:
     def __init__(self):
-        self.queues: dict[str, list[Player]] = {m: [] for m in MODES}
-        self.players: dict[str, Player] = {}
-        self.matches: dict[str, Match] = {}
+        self.rooms: dict[str, Room] = {}
+        self.player_to_room: dict[int, str] = {}  # id(ws) -> match_id
         self.timers: dict[str, asyncio.Task] = {}
         self.lock = asyncio.Lock()
 
     async def handle(self, ws):
-        """Обработка одного WebSocket-подключения."""
-        player_id = None
         try:
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
-                    log.warning(f"Плохой JSON: {raw[:100]}")
                     continue
 
                 msg_type = msg.get("type")
 
-                if msg_type == "queue":
-                    player_id = msg.get("player_id") or str(uuid.uuid4())[:8]
-                    mode = msg.get("mode", "classic")
-                    nickname = msg.get("nickname", "Player")
-                    await self.add_to_queue(player_id, nickname, mode, ws)
-                    await ws.send(json.dumps({
-                        "type": "queued",
-                        "player_id": player_id,
-                        "mode": mode,
-                    }))
+                if msg_type == "create_room":
+                    await self.create_room(ws, msg)
 
-                elif msg_type == "leave_queue":
-                    if player_id:
-                        await self.remove_from_queue(player_id)
+                elif msg_type == "find_match":
+                    await self.find_match(ws, msg)
 
-                elif msg_type == "host_ready":
-                    oid = msg.get("noray_oid", "")
-                    if player_id:
-                        await self.on_host_ready(player_id, oid)
+                elif msg_type == "leave":
+                    await self.remove_player(ws)
 
                 elif msg_type == "ping":
                     await ws.send(json.dumps({"type": "pong"}))
 
         except websockets.exceptions.ConnectionClosed:
-            log.info(f"Соединение закрыто: {player_id}")
-        except Exception as e:
-            log.error(f"Ошибка в handle: {e}")
+            pass
         finally:
-            if player_id:
-                await self.remove_from_queue(player_id)
+            await self.remove_player(ws)
 
-    async def add_to_queue(self, player_id: str, nickname: str, mode: str, ws):
+    async def create_room(self, ws, msg):
         async with self.lock:
+            match_id = str(uuid.uuid4())[:6].upper()
+            mode = msg.get("mode", "classic")
             if mode not in MODES:
-                log.warning(f"Неизвестный режим {mode}, ставлю classic")
                 mode = "classic"
 
-            # Если игрок уже в очереди — удалить старую запись
-            if player_id in self.players:
-                await self._remove_locked(player_id)
+            room = Room(
+                match_id=match_id,
+                mode=mode,
+                map_name=msg.get("map", "Island"),
+                host_nickname=msg.get("host_nickname", "Host"),
+                host_ws=ws,
+                host_oid=msg.get("noray_oid", ""),
+                max_players=min(int(msg.get("max_players", MODES[mode]["max_players"])),
+                                MODES[mode]["max_players"]),
+            )
+            room.players.append((ws, room.host_nickname))
+            self.rooms[match_id] = room
+            self.player_to_room[id(ws)] = match_id
 
-            player = Player(player_id, nickname, mode, ws)
-            self.players[player_id] = player
-            self.queues[mode].append(player)
+            log.info(f"Комната {match_id} ({mode}, {room.map_name}) создана хостом {room.host_nickname}. OID={room.host_oid}")
 
-            count = len(self.queues[mode])
-            log.info(f"{nickname} ({player_id}) → очередь {mode}. Всего: {count}")
-
-            # Таймер на добор
-            if mode not in self.timers or self.timers[mode].done():
-                self.timers[mode] = asyncio.create_task(self.queue_timer(mode))
-
-            await self._try_start_match(mode)
-
-    async def remove_from_queue(self, player_id: str):
-        async with self.lock:
-            await self._remove_locked(player_id)
-
-    async def _remove_locked(self, player_id: str):
-        if player_id not in self.players:
-            return
-        player = self.players.pop(player_id)
-        queue = self.queues.get(player.mode, [])
-        if player in queue:
-            queue.remove(player)
-            log.info(f"{player.nickname} вышел. Осталось: {len(queue)}")
-
-    async def queue_timer(self, mode: str):
-        """Таймаут: если долго никто не идёт — старт с теми, кто есть."""
-        await asyncio.sleep(MODES[mode]["timeout_sec"])
-        async with self.lock:
-            queue = self.queues[mode]
-            if len(queue) >= MODES[mode]["min_players"]:
-                log.info(f"Таймаут {mode}. Запускаю с {len(queue)} игроками")
-                await self._create_match(mode)
-            elif queue:
-                log.info(f"Таймаут {mode}, но игроков мало: {len(queue)}")
-
-    async def _try_start_match(self, mode: str):
-        """Проверяет, набралось ли максимум игроков."""
-        queue = self.queues[mode]
-        if len(queue) >= MODES[mode]["max_players"]:
-            await self._create_match(mode)
-
-    async def _create_match(self, mode: str):
-        """Формирует матч, выбирает хоста."""
-        queue = self.queues[mode]
-        if len(queue) < MODES[mode]["min_players"]:
-            return
-
-        count = min(len(queue), MODES[mode]["max_players"])
-        players = queue[:count]
-        self.queues[mode] = queue[count:]
-
-        match_id = str(uuid.uuid4())[:6].upper()
-        host = players[0]
-
-        match = Match(
-            match_id=match_id,
-            mode=mode,
-            host_id=host.player_id,
-            players=players,
-        )
-        self.matches[match_id] = match
-
-        for p in players:
-            p.match_id = match_id
-
-        log.info(f"Матч {match_id} ({mode}): {count} игроков. Хост: {host.nickname}")
-
-        # Хосту — команда создать комнату
-        try:
-            await host.ws.send(json.dumps({
-                "type": "you_are_host",
+            await ws.send(json.dumps({
+                "type": "room_created",
                 "match_id": match_id,
-                "mode": mode,
-                "players": [
-                    {"id": p.player_id, "nickname": p.nickname}
-                    for p in players
-                ],
             }))
-        except Exception as e:
-            log.error(f"Не отправить хосту: {e}")
 
-        # Остальным — ждать OID хоста
-        for p in players[1:]:
-            try:
-                await p.ws.send(json.dumps({
-                    "type": "waiting_for_host",
-                    "match_id": match_id,
+            # Таймер на добор игроков
+            self.timers[match_id] = asyncio.create_task(self._room_timer(match_id))
+
+    async def find_match(self, ws, msg):
+        """Игрок хочет играть. Ищем комнату или создаём новую."""
+        async with self.lock:
+            mode = msg.get("mode", "classic")
+            map_name = msg.get("map", "Island")
+            nickname = msg.get("nickname", "Player")
+
+            # Ищем комнату с местом
+            room = None
+            for r in self.rooms.values():
+                if (r.mode == mode
+                        and r.map_name == map_name
+                        and not r.match_started
+                        and len(r.players) < r.max_players):
+                    room = r
+                    break
+
+            if room is None:
+                # Нет комнаты — создаём, игрок становится хостом
+                # Но у него ещё нет noray_oid — он получит его от клиента
+                # В этом случае мы ждём, пока клиент сам не создаст noray-комнату
+                # и не отправит register_room. Пока — отвечаем "нужно создать".
+                await ws.send(json.dumps({
+                    "type": "no_room",
                     "mode": mode,
-                    "host_nickname": host.nickname,
+                    "map": map_name,
+                    "message": "Нет комнат. Создай комнату через Create Room.",
                 }))
-            except Exception as e:
-                log.error(f"Не отправить клиенту: {e}")
+                return
 
-    async def on_host_ready(self, host_id: str, noray_oid: str):
-        """Хост сообщил свой OID — рассылаем всем в его матче."""
-        if host_id not in self.players:
-            log.warning(f"host_ready от неизвестного {host_id}")
+            # Присоединяем
+            room.players.append((ws, nickname))
+            self.player_to_room[id(ws)] = room.match_id
+            log.info(f"{nickname} присоединился к {room.match_id}. Игроков: {len(room.players)}/{room.max_players}")
+
+            # Отправляем OID хоста
+            await ws.send(json.dumps({
+                "type": "match_ready",
+                "match_id": room.match_id,
+                "noray_oid": room.host_oid,
+                "mode": room.mode,
+                "map": room.map_name,
+            }))
+
+            # Проверяем, набралось ли минимум
+            await self._check_ready(room)
+
+    async def _check_ready(self, room: Room):
+        if room.match_started:
+            return
+        if len(room.players) < MODES[room.mode]["min_players"]:
             return
 
-        player = self.players[host_id]
-        match_id = player.match_id
-        if not match_id or match_id not in self.matches:
-            log.warning(f"У {host_id} нет активного матча")
-            return
+        # Все игроки набраны — команда старт
+        room.match_started = True
+        log.info(f"Матч {room.match_id} стартует. Игроков: {len(room.players)}")
 
-        match = self.matches[match_id]
-        match.host_oid = noray_oid
-        log.info(f"Матч {match_id}: хост {host_id} готов. OID={noray_oid}")
-
-        # Рассылаем всем клиентам матча
-        for p in match.players:
-            if p.player_id == host_id:
-                continue
+        for (pws, _) in room.players:
             try:
-                await p.ws.send(json.dumps({
-                    "type": "match_ready",
-                    "match_id": match_id,
-                    "host_oid": noray_oid,
-                    "mode": match.mode,
+                await pws.send(json.dumps({
+                    "type": "start_match",
+                    "match_id": room.match_id,
                 }))
             except Exception as e:
-                log.error(f"Не отправить OID клиенту {p.player_id}: {e}")
+                log.error(f"Не отправить start_match: {e}")
+
+    async def _room_timer(self, match_id: str):
+        await asyncio.sleep(MODES["classic"]["timeout_sec"])
+        async with self.lock:
+            room = self.rooms.get(match_id)
+            if room and not room.match_started:
+                if len(room.players) >= MODES[room.mode]["min_players"]:
+                    await self._check_ready(room)
+                else:
+                    log.info(f"Комната {match_id} закрыта по таймауту (мало игроков)")
+
+    async def remove_player(self, ws):
+        async with self.lock:
+            match_id = self.player_to_room.pop(id(ws), None)
+            if not match_id:
+                return
+            room = self.rooms.get(match_id)
+            if not room:
+                return
+
+            # Удаляем игрока из комнаты
+            room.players = [(p, n) for (p, n) in room.players if p is not ws]
+
+            # Если хост ушёл — удаляем комнату
+            if room.host_ws is ws:
+                log.info(f"Хост ушёл, комната {match_id} удалена")
+                for (pws, _) in room.players:
+                    try:
+                        await pws.send(json.dumps({"type": "room_closed"}))
+                    except Exception:
+                        pass
+                del self.rooms[match_id]
+                if match_id in self.timers:
+                    self.timers[match_id].cancel()
+                    del self.timers[match_id]
+            else:
+                log.info(f"Игрок вышел из {match_id}. Осталось: {len(room.players)}")
 
 
 async def health_check(connection, request):
-    """HTTP health check для Render."""
     if request.path == "/healthz":
         return connection.respond(200, "OK\n")
-    # Если это WebSocket-апгрейд — пропускаем, websockets.serve обработает сам
     if "Upgrade" in request.headers and request.headers["Upgrade"].lower() == "websocket":
         return None
     return connection.respond(404, "Not Found\n")
 
 
 async def main():
-    matchmaker = Matchmaker()
-
+    mm = Matchmaker()
     port = int(os.environ.get("PORT", 8765))
-    host = "0.0.0.0"
+    log.info(f"Matchmaker запущен на 0.0.0.0:{port}")
 
-    log.info(f"Matchmaker запущен на ws://{host}:{port}")
-    log.info(f"Режимы: classic (2-4), battle_royale (4-20)")
-
-    # Обработка SIGTERM (для корректного деплоя на Render)
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
 
@@ -276,15 +236,8 @@ async def main():
         except NotImplementedError:
             pass
 
-    async with websockets.serve(
-        matchmaker.handle,
-        host,
-        port,
-        process_request=health_check,
-    ):
+    async with websockets.serve(mm.handle, "0.0.0.0", port, process_request=health_check):
         await stop
-
-    log.info("Matchmaker остановлен")
 
 
 if __name__ == "__main__":
