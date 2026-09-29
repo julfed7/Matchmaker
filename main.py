@@ -247,6 +247,9 @@ async def health_check(connection, request):
     """HTTP health check для Render."""
     if request.path == "/healthz":
         return connection.respond(200, "OK\n")
+    # Если это WebSocket-апгрейд — пропускаем, websockets.serve обработает сам
+    if "Upgrade" in request.headers and request.headers["Upgrade"].lower() == "websocket":
+        return None
     return connection.respond(404, "Not Found\n")
 
 
