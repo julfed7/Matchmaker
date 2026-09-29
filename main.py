@@ -1,7 +1,8 @@
 """
 Matchmaker для Cubism D.
-- classic       — ОТКРЫТАЯ комната. Любой может присоединиться через find_match.
-- battle_royale — ЗАКРЫТАЯ комната. Только по OID хоста (join_by_oid).
+- Classic: 2-4 игрока, открытая комната.
+- Battle Royale: 10-20 игроков, открытая комната.
+- Комната открыта, пока хост не начал матч. После старта — закрыта.
 """
 
 import asyncio
@@ -22,19 +23,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Режимы
 MODES = {
     "classic": {
         "min_players": 2,
         "max_players": 4,
-        "timeout_sec": 30,
-        "open": True,   # ← видна всем в find_match
+        "timeout_sec": 60,
     },
     "battle_royale": {
-        "min_players": 2,
+        "min_players": 10,
         "max_players": 20,
-        "timeout_sec": 60,
-        "open": False,  # ← только по OID
+        "timeout_sec": 120,
     },
 }
 
@@ -48,15 +46,16 @@ class Room:
     host_ws: object
     host_oid: str
     max_players: int
-    players: list = field(default_factory=list)  # [(ws, nickname), ...]
+    players: list = field(default_factory=list)
     match_started: bool = False
+    auto_started: bool = False
 
 
 class Matchmaker:
     def __init__(self):
         self.rooms: dict[str, Room] = {}
-        self.oid_to_match: dict[str, str] = {}  # host_oid -> match_id
-        self.player_to_room: dict[int, str] = {}  # id(ws) -> match_id
+        self.oid_to_match: dict[str, str] = {}
+        self.player_to_room: dict[int, str] = {}
         self.timers: dict[str, asyncio.Task] = {}
         self.lock = asyncio.Lock()
 
@@ -69,19 +68,18 @@ class Matchmaker:
                     continue
 
                 t = msg.get("type")
+                log.info(f"← {t}")
 
                 if t == "create_room":
                     await self.create_room(ws, msg)
-
                 elif t == "find_match":
                     await self.find_match(ws, msg)
-
                 elif t == "join_by_oid":
                     await self.join_by_oid(ws, msg)
-
+                elif t == "start_match":
+                    await self.start_match(ws, msg)
                 elif t == "leave":
                     await self.remove_player(ws)
-
                 elif t == "ping":
                     await ws.send(json.dumps({"type": "pong"}))
 
@@ -118,20 +116,21 @@ class Matchmaker:
             self.player_to_room[id(ws)] = match_id
 
             log.info(
-                f"Комната {match_id} ({mode}, {room.map_name}) "
-                f"создана хостом {room.host_nickname}. OID={room.host_oid}. "
-                f"Открыта: {MODES[mode]['open']}"
+                f"✓ Комната {match_id} ({mode}/{room.map_name}) создана "
+                f"хостом {room.host_nickname}. OID={room.host_oid} "
+                f"min={MODES[mode]['min_players']} max={room.max_players}"
             )
 
             await ws.send(json.dumps({
                 "type": "room_created",
                 "match_id": match_id,
-                "is_open": MODES[mode]["open"],
+                "min_players": MODES[mode]["min_players"],
+                "max_players": room.max_players,
             }))
 
             self.timers[match_id] = asyncio.create_task(self._room_timer(match_id))
 
-    # === FIND MATCH (только открытые комнаты) ===
+    # === FIND MATCH ===
 
     async def find_match(self, ws, msg):
         async with self.lock:
@@ -142,29 +141,20 @@ class Matchmaker:
             if mode not in MODES:
                 mode = "classic"
 
-            # Закрытый режим — не ищем, отправляем подсказку
-            if not MODES[mode]["open"]:
-                log.info(f"{nickname} пытался войти в закрытый режим {mode}")
-                await ws.send(json.dumps({
-                    "type": "private_room",
-                    "mode": mode,
-                    "message": "Этот режим только по приглашению. Введи OID хоста.",
-                }))
-                return
+            log.info(f"Поиск {nickname}: {mode}/{map_name}")
 
-            # Ищем открытую комнату с местом
+            # Ищем ОТКРЫТЫЕ (не начатые) комнаты с местом
             room = None
             for r in self.rooms.values():
                 if (r.mode == mode
                         and r.map_name == map_name
                         and not r.match_started
-                        and len(r.players) < r.max_players
-                        and MODES[r.mode]["open"]):
+                        and len(r.players) < r.max_players):
                     room = r
                     break
 
             if room is None:
-                log.info(f"{nickname}: нет открытых комнат {mode}/{map_name}")
+                log.info(f"✗ {nickname}: нет комнат {mode}/{map_name}")
                 await ws.send(json.dumps({
                     "type": "no_room",
                     "mode": mode,
@@ -173,10 +163,12 @@ class Matchmaker:
                 }))
                 return
 
-            # Присоединяем
             room.players.append((ws, nickname))
             self.player_to_room[id(ws)] = room.match_id
-            log.info(f"{nickname} → {room.match_id}. Игроков: {len(room.players)}/{room.max_players}")
+            log.info(
+                f"✓ {nickname} → {room.match_id}. "
+                f"Игроков: {len(room.players)}/{room.max_players}"
+            )
 
             await ws.send(json.dumps({
                 "type": "match_ready",
@@ -184,11 +176,17 @@ class Matchmaker:
                 "noray_oid": room.host_oid,
                 "mode": room.mode,
                 "map": room.map_name,
+                "players_count": len(room.players),
+                "max_players": room.max_players,
+                "min_players": MODES[room.mode]["min_players"],
             }))
 
-            await self._check_ready(room)
+            # Авто-старт, если набрался максимум
+            if len(room.players) >= room.max_players:
+                room.auto_started = True
+                await self._start_room(room, auto=True)
 
-    # === JOIN BY OID (для закрытых комнат) ===
+    # === JOIN BY OID ===
 
     async def join_by_oid(self, ws, msg):
         async with self.lock:
@@ -196,15 +194,11 @@ class Matchmaker:
             nickname = msg.get("nickname", "Player")
 
             if not host_oid:
-                await ws.send(json.dumps({
-                    "type": "error",
-                    "message": "Пустой OID",
-                }))
+                await ws.send(json.dumps({"type": "error", "message": "Пустой OID"}))
                 return
 
             match_id = self.oid_to_match.get(host_oid)
             if not match_id or match_id not in self.rooms:
-                log.info(f"{nickname}: OID {host_oid} не найден")
                 await ws.send(json.dumps({
                     "type": "error",
                     "message": "Комната с таким OID не найдена",
@@ -227,7 +221,7 @@ class Matchmaker:
 
             room.players.append((ws, nickname))
             self.player_to_room[id(ws)] = match_id
-            log.info(f"{nickname} → {match_id} (по OID). Игроков: {len(room.players)}/{room.max_players}")
+            log.info(f"✓ {nickname} → {match_id} (по OID). {len(room.players)}/{room.max_players}")
 
             await ws.send(json.dumps({
                 "type": "match_ready",
@@ -235,41 +229,78 @@ class Matchmaker:
                 "noray_oid": room.host_oid,
                 "mode": room.mode,
                 "map": room.map_name,
+                "players_count": len(room.players),
+                "max_players": room.max_players,
+                "min_players": MODES[room.mode]["min_players"],
             }))
 
-            await self._check_ready(room)
+    # === START MATCH (от хоста) ===
 
-    # === MATCH READY ===
+    async def start_match(self, ws, msg):
+        async with self.lock:
+            match_id = msg.get("match_id", "")
+            room = self.rooms.get(match_id)
+            if not room:
+                await ws.send(json.dumps({
+                    "type": "error",
+                    "message": "Комната не найдена",
+                }))
+                return
+            if room.host_ws is not ws:
+                await ws.send(json.dumps({
+                    "type": "error",
+                    "message": "Только хост может начать матч",
+                }))
+                return
+            if room.match_started:
+                return
 
-    async def _check_ready(self, room: Room):
-        if room.match_started:
-            return
-        if len(room.players) < MODES[room.mode]["min_players"]:
-            return
+            await self._start_room(room, auto=False)
 
+    async def _start_room(self, room: Room, auto: bool):
         room.match_started = True
-        log.info(f"Матч {room.match_id} ({room.mode}) готов. Игроков: {len(room.players)}")
+        reason = "авто" if auto else "хост"
+        log.info(
+            f"✓ Матч {room.match_id} ({room.mode}) стартует [{reason}]. "
+            f"Игроков: {len(room.players)}"
+        )
 
         for (pws, _) in room.players:
             try:
                 await pws.send(json.dumps({
-                    "type": "start_match",
+                    "type": "match_started",
                     "match_id": room.match_id,
+                    "auto": auto,
                 }))
             except Exception as e:
-                log.error(f"Не отправить start_match: {e}")
+                log.error(f"Не отправить match_started: {e}")
 
     async def _room_timer(self, match_id: str):
-        await asyncio.sleep(MODES["classic"]["timeout_sec"])
+        room = self.rooms.get(match_id)
+        if not room:
+            return
+        await asyncio.sleep(MODES[room.mode]["timeout_sec"])
         async with self.lock:
             room = self.rooms.get(match_id)
             if room and not room.match_started:
                 if len(room.players) >= MODES[room.mode]["min_players"]:
-                    await self._check_ready(room)
+                    log.info(f"Таймаут {match_id}: старт с {len(room.players)} игроками")
+                    await self._start_room(room, auto=True)
                 else:
-                    log.info(f"Комната {match_id} закрыта по таймауту")
+                    log.info(f"✗ Комната {match_id} закрыта по таймауту")
+                    for (pws, _) in room.players:
+                        try:
+                            await pws.send(json.dumps({
+                                "type": "room_closed",
+                                "message": "Недостаточно игроков",
+                            }))
+                        except Exception:
+                            pass
+                    if room.host_oid in self.oid_to_match:
+                        del self.oid_to_match[room.host_oid]
+                    del self.rooms[match_id]
 
-    # === REMOVE PLAYER ===
+    # === REMOVE ===
 
     async def remove_player(self, ws):
         async with self.lock:
@@ -283,7 +314,7 @@ class Matchmaker:
             room.players = [(p, n) for (p, n) in room.players if p is not ws]
 
             if room.host_ws is ws:
-                log.info(f"Хост ушёл, комната {match_id} удалена")
+                log.info(f"✗ Хост ушёл, комната {match_id} удалена")
                 for (pws, _) in room.players:
                     try:
                         await pws.send(json.dumps({"type": "room_closed"}))
